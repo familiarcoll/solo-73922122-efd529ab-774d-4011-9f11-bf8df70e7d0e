@@ -40,6 +40,16 @@ class Settings:
         return self.root / "tmp"
 
     @property
+    def leases_dir(self) -> Path:
+        """Liveness leases for files that are written but not yet registered."""
+        return self.root / "leases"
+
+    @property
+    def sweep_lock_path(self) -> Path:
+        """Serialises orphan sweeps across instances (distinct from merges)."""
+        return self.root / "sweep.lock"
+
+    @property
     def db_path(self) -> Path:
         return self.root / "lake.sqlite3"
 

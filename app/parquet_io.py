@@ -42,6 +42,15 @@ class WrittenFile:
     row_count: int
 
 
+def new_file_id(prefix: str) -> str:
+    """Generate a globally unique file id (``b_...`` or ``m_...``).
+
+    The id is chosen by the caller so it can take a cross-instance upload
+    lease on it *before* the first byte is written.
+    """
+    return f"{prefix}_{uuid.uuid4().hex}"
+
+
 def utcnow() -> datetime:
     return datetime.now(UTC)
 
@@ -94,8 +103,8 @@ def write_batch(
     batches_dir: Path,
     table: pa.Table,
     batch_id: str,
-) -> tuple[str, WrittenFile]:
-    file_id = f"b_{uuid.uuid4().hex}"
+    file_id: str,
+) -> WrittenFile:
     metadata = dict(TRAJECTORY_SCHEMA.metadata or {})
     metadata.update(
         {
@@ -120,7 +129,7 @@ def write_batch(
         sha256=sha256_file(final_path),
         row_count=table.num_rows,
     )
-    return file_id, written
+    return written
 
 
 def read_parquet(path: Path) -> pa.Table:
@@ -133,7 +142,8 @@ def write_merged(
     batches_dir: Path,
     inputs: list[tuple[str, Path]],
     merge_id: str,
-) -> tuple[str, WrittenFile]:
+    file_id: str,
+) -> WrittenFile:
     """Concatenate immutable inputs into one new file.
 
     Row order follows the input order, and no row de-duplication happens:
@@ -161,7 +171,6 @@ def write_merged(
     # Keep the declared metadata small and bounded: the authoritative input
     # list lives in SQLite (merge_inputs), not in the file header.
     merged = merged.replace_schema_metadata(metadata)
-    file_id = f"m_{uuid.uuid4().hex}"
     tmp_path = tmp_dir / f"{file_id}.parquet.tmp"
     try:
         pq.write_table(merged, tmp_path, compression="zstd", version="2.6")
@@ -177,7 +186,7 @@ def write_merged(
         sha256=sha256_file(final_path),
         row_count=merged.num_rows,
     )
-    return file_id, written
+    return written
 
 
 def merge_ids_metadata(input_ids: list[str]) -> str:

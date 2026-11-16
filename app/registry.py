@@ -38,8 +38,15 @@ from .errors import (
     NotFoundError,
     ValidationError,
 )
+from .leases import (
+    LeaseConflict,
+    UploadLease,
+    lease_key_for_filename,
+    lease_path,
+    probe_lease,
+)
 from .models import FileInfo
-from .parquet_io import now_iso, write_batch, write_merged
+from .parquet_io import new_file_id, now_iso, write_batch, write_merged
 
 try:  # POSIX (the Docker image is Linux)
     import fcntl
@@ -99,9 +106,11 @@ class Registry:
             root,
             self.settings.batches_dir,
             self.settings.tmp_dir,
+            self.settings.leases_dir,
         ):
             path.mkdir(parents=True, exist_ok=True)
         self.settings.lock_path.touch(exist_ok=True)
+        self.settings.sweep_lock_path.touch(exist_ok=True)
         db.initialise(self.settings.db_path, self.settings.db_busy_timeout_ms)
         try:
             self.run_maintenance()
@@ -131,12 +140,16 @@ class Registry:
                 print(f"warning: maintenance failed: {exc}")
 
     def run_maintenance(self) -> dict[str, int]:
-        # The orphan sweep must not overlap a merge: a merge publishes its
-        # Parquet (older than the sweep grace period only in theory, but
-        # never assume) before registering it.  Taking the shared merge lock
-        # makes sweep and merge mutually exclusive across instances.
+        # Sweeps are serialised against each other (across instances) with a
+        # lock that is *only* for the sweep.  They are never serialised
+        # against uploads or whole merges: an unregistered writer's file is
+        # protected by its upload lease, and a registered file by the atomic
+        # conditional UPDATE in recycle_retired.  Per-file deletion takes the
+        # merge lock non-blocking with a short timeout and simply defers on
+        # contention, so a paused upload, merge or peer cleanup can never
+        # stall another instance's maintenance or its traffic.
         try:
-            with FileLock(self.settings.lock_path, 0.5):
+            with FileLock(self.settings.sweep_lock_path, 0.5):
                 recycled = self.recycle_retired()
                 swept = self.sweep_orphans()
         except ConflictError:
@@ -198,59 +211,68 @@ class Registry:
             )
         parsed = parse_csv(payload, max_rows=self.settings.max_batch_rows)
         csv_sha256 = hashlib.sha256(payload).hexdigest()
-        file_id, written = write_batch(
-            tmp_dir=self.settings.tmp_dir,
-            batches_dir=self.settings.batches_dir,
-            table=parsed.table,
-            batch_id=batch_id,
-        )
-        created_at = now_iso()
-        try:
-            with self.connection() as conn, db.write_tx(conn):
-                conn.execute(
-                    """
-                        INSERT INTO files
-                            (id, kind, rel_path, rows, bytes, sha256, csv_sha256,
-                             source_batch_id, merge_id, created_at, live)
-                        VALUES (?, 'batch', ?, ?, ?, ?, ?, ?, NULL, ?, 1)
-                        """,
-                    (
-                        file_id,
-                        written.rel_path,
-                        written.row_count,
-                        written.byte_size,
-                        written.sha256,
-                        csv_sha256,
-                        batch_id,
-                        created_at,
-                    ),
-                )
-                row = conn.execute(
-                    """
-                        SELECT seq, id, kind, rel_path, rows, bytes, sha256,
-                               created_at, source_batch_id, merge_id
-                          FROM files WHERE id = ?
-                        """,
-                    (file_id,),
-                ).fetchone()
-        except sqlite3.IntegrityError:
-            # The unique batch id was already ingested.  Our file was never
-            # registered, so removing it cannot affect any valid state.
-            self._discard_unregistered(file_id, written.rel_path)
-            existing = self._find_batch(batch_id)
-            suffix = (
-                f"；已有文件 {existing.file_id}（{existing.rows} 行）"
-                if existing
-                else ""
+        file_id = new_file_id("b")
+        with UploadLease(self.settings.leases_dir, file_id):
+            # The lease is taken before the first byte is written and released
+            # only after the registry commit (or after an explicit discard).
+            # A paused upload therefore stays protected for as long as it
+            # pauses; a crashed upload releases the lease automatically.
+            written = write_batch(
+                tmp_dir=self.settings.tmp_dir,
+                batches_dir=self.settings.batches_dir,
+                table=parsed.table,
+                batch_id=batch_id,
+                file_id=file_id,
             )
-            raise ConflictError(f"批号 {batch_id!r} 已上传过{suffix}") from None
-        except BaseException:
-            # Disk write succeeded but registration failed: if the row was
-            # not committed the file is invisible, so removing it is safe.
-            # Verify first in case the commit did land and a later error was
-            # raised (deleting a live file would be catastrophic).
-            self._discard_unregistered(file_id, written.rel_path)
-            raise
+            created_at = now_iso()
+            try:
+                with self.connection() as conn, db.write_tx(conn):
+                    conn.execute(
+                        """
+                            INSERT INTO files
+                                (id, kind, rel_path, rows, bytes, sha256, csv_sha256,
+                                 source_batch_id, merge_id, created_at, live)
+                            VALUES (?, 'batch', ?, ?, ?, ?, ?, ?, NULL, ?, 1)
+                            """,
+                        (
+                            file_id,
+                            written.rel_path,
+                            written.row_count,
+                            written.byte_size,
+                            written.sha256,
+                            csv_sha256,
+                            batch_id,
+                            created_at,
+                        ),
+                    )
+                    row = conn.execute(
+                        """
+                            SELECT seq, id, kind, rel_path, rows, bytes, sha256,
+                                   created_at, source_batch_id, merge_id
+                              FROM files WHERE id = ?
+                            """,
+                        (file_id,),
+                    ).fetchone()
+            except sqlite3.IntegrityError:
+                # The unique batch id was already ingested.  Our file was never
+                # registered, so removing it cannot affect any valid state.
+                self._discard_unregistered(file_id, written.rel_path)
+                existing = self._find_batch(batch_id)
+                suffix = (
+                    f"；已有文件 {existing.file_id}（{existing.rows} 行）"
+                    if existing
+                    else ""
+                )
+                raise ConflictError(
+                    f"批号 {batch_id!r} 已上传过{suffix}"
+                ) from None
+            except BaseException:
+                # Disk write succeeded but registration failed: if the row was
+                # not committed the file is invisible, so removing it is safe.
+                # Verify first in case the commit did land and a later error
+                # was raised (deleting a live file would be catastrophic).
+                self._discard_unregistered(file_id, written.rel_path)
+                raise
         return {"batch_id": batch_id, "file": self._file_info(row)}
 
     def _discard_unregistered(self, file_id: str, rel_path: str) -> None:
@@ -332,47 +354,56 @@ class Registry:
                 if not inputs:
                     raise ConflictError("当前没有现行文件，无需合并")
                 expected_rows = sum(item[2] for item in inputs)
-                try:
-                    file_id, written = write_merged(
-                        tmp_dir=self.settings.tmp_dir,
-                        batches_dir=self.settings.batches_dir,
-                        inputs=[(file_id, path) for file_id, path, _ in inputs],
-                        merge_id=merge_id,
-                    )
-                except FileNotFoundError:
-                    # Extremely defensive: an input vanished mid-merge.  Do
-                    # not publish; retry from a fresh snapshot.
-                    time.sleep(0.05)
-                    continue
-                if written.row_count != expected_rows:
-                    self._abs(written.rel_path).unlink(missing_ok=True)
-                    raise CorruptError(
-                        "合并输出的行数与输入行数不一致，已放弃本次合并结果"
-                    )
-                committed_at = now_iso()
-                try:
-                    with self.connection() as conn:
-                        self._commit_merge(
-                            conn,
+                file_id = new_file_id("m")
+                with UploadLease(self.settings.leases_dir, file_id):
+                    # The lease spans publish + commit, so a sweep can never
+                    # mistake a slow merge's unregistered output for an
+                    # abandoned file.  It is released automatically if this
+                    # process dies mid-merge.
+                    try:
+                        written = write_merged(
+                            tmp_dir=self.settings.tmp_dir,
+                            batches_dir=self.settings.batches_dir,
+                            inputs=[
+                                (file_id, path) for file_id, path, _ in inputs
+                            ],
                             merge_id=merge_id,
-                            started_at=started_at,
-                            committed_at=committed_at,
                             file_id=file_id,
-                            written=written,
-                            input_ids=[item[0] for item in inputs],
                         )
-                except StaleInputs:
-                    self._discard_unregistered(file_id, written.rel_path)
-                    time.sleep(0.05)
-                    continue
-                except BaseException:
-                    # Re-check before deleting: if COMMIT actually landed and
-                    # the error came afterwards, the output is live and must
-                    # never be removed.
-                    self._discard_unregistered(file_id, written.rel_path)
-                    raise
+                    except FileNotFoundError:
+                        # Extremely defensive: an input vanished mid-merge.
+                        # Do not publish; retry from a fresh snapshot.
+                        time.sleep(0.05)
+                        continue
+                    if written.row_count != expected_rows:
+                        self._abs(written.rel_path).unlink(missing_ok=True)
+                        raise CorruptError(
+                            "合并输出的行数与输入行数不一致，已放弃本次合并结果"
+                        )
+                    committed_at = now_iso()
+                    try:
+                        with self.connection() as conn:
+                            self._commit_merge(
+                                conn,
+                                merge_id=merge_id,
+                                started_at=started_at,
+                                committed_at=committed_at,
+                                file_id=file_id,
+                                written=written,
+                                input_ids=[item[0] for item in inputs],
+                            )
+                    except StaleInputs:
+                        self._discard_unregistered(file_id, written.rel_path)
+                        time.sleep(0.05)
+                        continue
+                    except BaseException:
+                        # Re-check before deleting: if COMMIT actually landed
+                        # and the error came afterwards, the output is live and
+                        # must never be removed.
+                        self._discard_unregistered(file_id, written.rel_path)
+                        raise
                 try:
-                    self.recycle_retired()
+                    self.recycle_retired(merge_lock_held=True)
                 except Exception as exc:  # best effort after a successful commit
                     print(f"warning: recycling after merge failed: {exc}")
                 return {
@@ -669,11 +700,27 @@ class Registry:
             return row["rel_path"], row["bytes"], row["sha256"]
 
     # ----------------------------------------------------------- maintenance
-    def recycle_retired(self) -> int:
-        """Mark and physically remove retired files no open manifest pins."""
+    def recycle_retired(self, *, merge_lock_held: bool = False) -> int:
+        """Mark and physically remove retired files no open manifest pins.
+
+        A file's liveness and a manifest's pin can only change in a
+        ``BEGIN IMMEDIATE`` transaction (merge commit / claim).  Each
+        candidate is therefore claimed with one atomic conditional UPDATE
+        that re-checks ``live = 0``, ``recycled_at IS NULL`` and "no open
+        manifest references it"; only the winner of that update unlinks the
+        path, making concurrent recyclers idempotent.
+
+        Deletion is additionally guarded by the merge lock (taken once per
+        pass, non-blocking, short timeout): a merge reads its input Parquets
+        after snapshotting them, and another merge may have retired those
+        inputs in the meantime.  On contention the whole recycle step defers
+        to the next pass, so a paused merge only postpones removal of already
+        retired files -- never uploads, claims, downloads or the sweep of
+        unregistered orphans (which runs before/independently).
+        """
         now = now_iso()
-        with self.connection() as conn, db.write_tx(conn):
-            rows = conn.execute(
+        with self.connection() as conn, db.read_tx(conn):
+            candidates = conn.execute(
                 """
                     SELECT f.id, f.rel_path
                       FROM files f
@@ -686,25 +733,87 @@ class Registry:
                             WHERE mf.file_id = f.id
                               AND m.state = 'open'
                        )
+                     ORDER BY f.seq
                      LIMIT 500
                     """
             ).fetchall()
-            if rows:
-                conn.executemany(
-                    "UPDATE files SET recycled_at = ? WHERE id = ?",
-                    [(now, row["id"]) for row in rows],
-                )
+        if not candidates:
+            return 0
+        if merge_lock_held:
+            return self._recycle_candidates(candidates, now)
+        try:
+            # One short, non-blocking acquisition per pass: if a merge is
+            # running, the whole recycle step is deferred to the next pass
+            # (never more than 0.5 s of waiting here).
+            with FileLock(self.settings.lock_path, 0.5):
+                return self._recycle_candidates(candidates, now)
+        except ConflictError:
+            return 0
+
+    def _recycle_candidates(self, candidates, reclaimed_at: str) -> int:
         removed = 0
-        for row in rows:
-            try:
-                self._abs(row["rel_path"]).unlink(missing_ok=True)
+        for row in candidates:
+            if self._claim_and_unlink(row["id"], row["rel_path"], reclaimed_at):
                 removed += 1
-            except OSError as exc:  # pragma: no cover - disk-level failure
-                print(f"warning: could not recycle {row['rel_path']}: {exc}")
         return removed
 
+    def _claim_and_unlink(
+        self, file_id: str, rel_path: str, reclaimed_at: str
+    ) -> bool:
+        # Claim the row under BEGIN IMMEDIATE: only the winner of this update
+        # may unlink the path, which makes concurrent recyclers idempotent.
+        with self.connection() as conn:
+            with db.write_tx(conn):
+                claimed = conn.execute(
+                    """
+                    UPDATE files
+                       SET recycled_at = ?
+                     WHERE id = ? AND live = 0 AND recycled_at IS NULL
+                       AND NOT EXISTS (
+                           SELECT 1
+                             FROM manifest_files mf
+                             JOIN manifests m ON m.id = mf.manifest_id
+                            WHERE mf.file_id = files.id
+                              AND m.state = 'open'
+                       )
+                    """,
+                    (reclaimed_at, file_id),
+                ).rowcount
+        if claimed != 1:
+            return False
+        path = self._abs(rel_path)
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:  # pragma: no cover - disk-level failure
+            # The row is already marked; a retry cannot see it again.  Put
+            # the claim back so the next pass retries the deletion.
+            with self.connection() as conn, db.write_tx(conn):
+                conn.execute(
+                    "UPDATE files SET recycled_at = NULL WHERE id = ?",
+                    (file_id,),
+                )
+            print(f"warning: could not recycle {rel_path}: {exc}")
+            return False
+        return True
+
     def sweep_orphans(self) -> int:
-        """Remove abandoned files: unregistered Parquet and stale temp files."""
+        """Remove abandoned files: unregistered Parquet and stale temp files.
+
+        An unregistered Parquet is deleted only if no live writer holds its
+        upload lease, the registry re-checked under that lease still has no
+        row for it, and it is older than the grace period.  The lease check is
+        what protects a slow upload: age is no longer used as evidence that a
+        writer is dead.
+
+        The registry snapshot is taken *before* the scan, so a file registered
+        between snapshot and scan is a sweep candidate; the lease re-check
+        after the writer finishes (and the in-scan re-check) prevents it from
+        being deleted.  If the sweep itself dies between unlink and bookkeeping
+        the next pass simply finishes the job: unregistered files are
+        reclaimed again, and recycled-registry entries are skipped by name.
+        """
         now = time.time()
         grace = self.settings.orphan_grace_s
         known: set[str] = set()
@@ -719,41 +828,133 @@ class Registry:
                 else:
                     recycled.add(rel)
         removed = 0
-        if self.settings.batches_dir.exists():
-            for path in self.settings.batches_dir.iterdir():
-                if not path.is_file():
-                    continue
-                rel = str(path.relative_to(self.settings.root))
-                if rel in known:
-                    continue
-                if rel not in recycled:
-                    try:
-                        age = now - path.stat().st_mtime
-                    except FileNotFoundError:
-                        continue
-                    if age < grace:
-                        continue
-                try:
-                    path.unlink()
-                    removed += 1
-                except FileNotFoundError:
-                    pass
-                except OSError as exc:  # pragma: no cover
-                    print(f"warning: could not remove orphan {rel}: {exc}")
-        if self.settings.tmp_dir.exists():
-            for path in self.settings.tmp_dir.iterdir():
-                try:
+
+        def scan_dirs() -> int:
+            removed_here = 0
+            if self.settings.batches_dir.exists():
+                for path in self.settings.batches_dir.iterdir():
                     if not path.is_file():
                         continue
-                    if now - path.stat().st_mtime < grace:
+                    rel = str(path.relative_to(self.settings.root))
+                    if rel in known:
                         continue
-                    path.unlink()
-                    removed += 1
+                    if rel not in recycled:
+                        try:
+                            age = now - path.stat().st_mtime
+                        except FileNotFoundError:
+                            continue
+                        if age < grace:
+                            continue
+                    if not self._sweep_candidate_is_abandoned(path):
+                        continue
+                    try:
+                        path.unlink()
+                        removed_here += 1
+                    except FileNotFoundError:
+                        pass
+                    except OSError as exc:  # pragma: no cover
+                        print(f"warning: could not remove orphan {rel}: {exc}")
+            if self.settings.tmp_dir.exists():
+                for path in self.settings.tmp_dir.iterdir():
+                    try:
+                        if not path.is_file():
+                            continue
+                        if now - path.stat().st_mtime < grace:
+                            continue
+                        if not self._sweep_candidate_is_abandoned(path):
+                            continue
+                        path.unlink()
+                        removed_here += 1
+                    except FileNotFoundError:
+                        pass
+                    except OSError as exc:  # pragma: no cover
+                        print(f"warning: could not remove temp file {path}: {exc}")
+            return removed_here
+
+        # The scan is idempotent: if a previous sweep died half-way the next
+        # pass simply redoes it.  Dead leases left after their data file was
+        # already removed are finished off in the same pass.
+        removed += scan_dirs()
+        removed += self._sweep_dead_leases(now, grace)
+        return removed
+
+    def _sweep_dead_leases(self, now: float, grace: float) -> int:
+        """Finish a cleanup that died after removing the data file.
+
+        A lease whose data file is already gone (and whose writer is no
+        longer alive) is pure leftover: the previous sweep may have been
+        killed between ``unlink`` and lease cleanup.  Removing it lets the
+        next pass converge without extending any grace period.  A lease that
+        still has a data file is handled by the file scan above.
+        """
+        if not self.settings.leases_dir.exists():
+            return 0
+        removed = 0
+        for lease in self.settings.leases_dir.iterdir():
+            if not lease.is_file():
+                continue
+            key = lease_key_for_filename(lease.name)
+            if (
+                (self.settings.batches_dir / f"{key}.parquet").exists()
+                or (self.settings.tmp_dir / f"{key}.parquet.tmp").exists()
+            ):
+                continue
+            try:
+                if now - lease.stat().st_mtime < grace:
+                    continue
+            except FileNotFoundError:
+                continue
+            fd, writer_alive = probe_lease(self.settings.leases_dir, key)
+            if writer_alive:
+                continue
+            try:
+                lease.unlink(missing_ok=True)
+                removed += 1
+            except OSError:  # pragma: no cover
+                pass
+            finally:
+                if fd is not None:
+                    os.close(fd)
+        return removed
+
+    def _sweep_candidate_is_abandoned(self, path: Path) -> bool:
+        """Decide whether an unregistered-looking path may be deleted.
+
+        Caller has already applied the grace-period/mtime pre-filter.  The
+        authoritative check is done while holding the file's lease, so no
+        writer can start on the name in between, and the registry is re-read
+        to catch a registration committed after the sweep's snapshot.
+        """
+        key = lease_key_for_filename(path.name)
+        fd, writer_alive = probe_lease(self.settings.leases_dir, key)
+        if writer_alive:
+            # A live upload/merge owns this name, no matter how long it has
+            # paused.  Its lease disappears automatically if it exits.
+            return False
+        try:
+            rel = str(path.relative_to(self.settings.root))
+            with self.connection() as conn, db.read_tx(conn):
+                row = conn.execute(
+                    "SELECT recycled_at FROM files WHERE rel_path = ?",
+                    (rel,),
+                ).fetchone()
+            if row is not None and row["recycled_at"] is None:
+                # Registered successfully (possibly after the snapshot was
+                # taken).  Never delete a registered file.
+                return False
+            return True
+        finally:
+            if fd is not None:
+                # We hold the lease and its owner is gone, so the lease file
+                # itself is dead.  Remove it; the unique file id is never
+                # reused, so a later writer cannot need it.
+                try:
+                    os.unlink(lease_path(self.settings.leases_dir, key))
                 except FileNotFoundError:
                     pass
-                except OSError as exc:  # pragma: no cover
-                    print(f"warning: could not remove temp file {path}: {exc}")
-        return removed
+                except OSError:  # pragma: no cover
+                    pass
+                os.close(fd)
 
     # ------------------------------------------------------------------ stats
     def stats(self) -> dict:
