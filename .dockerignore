@@ -1,0 +1,10 @@
+# Keep build context small and avoid shipping local state into the image.
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.git/
+data/
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm

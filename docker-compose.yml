@@ -1,0 +1,36 @@
+name: trajectory-lake
+
+# Two API instances share one named volume.  Every piece of state that must be
+# visible to both instances lives on that volume: the Parquet files, the
+# SQLite registry and the cross-instance merge lock.
+services:
+  lake-a:
+    build: .
+    image: trajectory-lake:local
+    environment:
+      LAKE_ROOT: /data
+      LAKE_MAX_BATCH_ROWS: "1000"
+      LAKE_MAINTENANCE_INTERVAL_S: "30"
+    volumes:
+      - lake-data:/data
+    ports:
+      - "8080:8000"
+    restart: unless-stopped
+    stop_grace_period: 30s
+
+  lake-b:
+    build: .
+    image: trajectory-lake:local
+    environment:
+      LAKE_ROOT: /data
+      LAKE_MAX_BATCH_ROWS: "1000"
+      LAKE_MAINTENANCE_INTERVAL_S: "30"
+    volumes:
+      - lake-data:/data
+    ports:
+      - "8081:8000"
+    restart: unless-stopped
+    stop_grace_period: 30s
+
+volumes:
+  lake-data:
